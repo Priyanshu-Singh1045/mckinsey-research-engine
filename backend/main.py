@@ -17,6 +17,7 @@ from backend.api.research import router as research_router
 from backend.api.reports import router as reports_router
 from backend.api.evidence import router as evidence_router
 from backend.api.feedback import router as feedback_router
+from fastapi.middleware.cors import CORSMiddleware
 
 
 settings = get_settings()
@@ -77,3 +78,13 @@ async def health(request: Request):
         "status": "healthy",
         "request_id": request_id,
     }
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=[
+        "https://meridian-frontend-9hbvmxm7t-priyanshu-singh1045.vercel.app"
+    ],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
