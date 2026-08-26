@@ -82,7 +82,7 @@ async def health(request: Request):
 app.add_middleware(
     CORSMiddleware,
     allow_origins=[
-        "https://meridian-frontend-9hbvmxm7t-priyanshu-singh1045.vercel.app"
+        "https://meridian-frontend-mu.vercel.app"
     ],
     allow_credentials=True,
     allow_methods=["*"],
