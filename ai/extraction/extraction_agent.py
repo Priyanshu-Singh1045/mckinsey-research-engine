@@ -14,6 +14,9 @@ class ExtractionAgent:
 
     def extract(self, source: Source) -> list[Evidence]:
 
+        # --------------------------------------------------
+        # 1. Extract content from the source
+        # --------------------------------------------------
         extracted = self.browser.extract([source.url])
 
         if not extracted:
@@ -24,6 +27,9 @@ class ExtractionAgent:
         if not content:
             return []
 
+        # --------------------------------------------------
+        # 2. Build extraction prompt
+        # --------------------------------------------------
         prompt = f"""
 You are an evidence extraction agent.
 
@@ -68,39 +74,74 @@ Rules:
 - Return only JSON.
 """
 
+        # --------------------------------------------------
+        # 3. Generate response from Gemini
+        # --------------------------------------------------
         response = self.llm.generate(prompt)
-
-
 
         if not response:
             raise ValueError(
                 "Extraction agent received an empty response from the LLM."
             )
 
+        # --------------------------------------------------
+        # 4. Clean Gemini response
+        # --------------------------------------------------
         cleaned_response = response.strip()
 
+        # Remove Markdown code fences if Gemini returns:
+        #
+        # ```json
+        # [...]
+        # ```
         if cleaned_response.startswith("```"):
-            cleaned_response = cleaned_response.replace("```json", "")
-            cleaned_response = cleaned_response.replace("```", "")
-            cleaned_response = cleaned_response.strip()
+            lines = cleaned_response.splitlines()
 
+            if lines and lines[0].strip().startswith("```"):
+                lines = lines[1:]
+
+            if lines and lines[-1].strip() == "```":
+                lines = lines[:-1]
+
+            cleaned_response = "\n".join(lines).strip()
+
+        # --------------------------------------------------
+        # 5. Extract the JSON array
+        # --------------------------------------------------
+        # Sometimes Gemini may return extra text before or
+        # after the JSON. Find the first '[' and last ']'.
+        start = cleaned_response.find("[")
+        end = cleaned_response.rfind("]")
+
+        if start != -1 and end != -1 and start < end:
+            cleaned_response = cleaned_response[start:end + 1]
+
+        # --------------------------------------------------
+        # 6. Parse JSON
+        # --------------------------------------------------
         try:
             data = json.loads(cleaned_response)
 
         except json.JSONDecodeError as e:
             print("\n--- INVALID GEMINI RESPONSE ---")
-            print(cleaned_response)
+            print(repr(cleaned_response))
             print("--- END RESPONSE ---\n")
 
             raise ValueError(
                 "Extraction agent returned invalid JSON."
             ) from e
 
+        # --------------------------------------------------
+        # 7. Validate top-level JSON structure
+        # --------------------------------------------------
         if not isinstance(data, list):
             raise ValueError(
                 "Extraction agent expected a JSON array."
             )
 
+        # --------------------------------------------------
+        # 8. Validate evidence items
+        # --------------------------------------------------
         evidence = []
 
         required_fields = [
@@ -120,6 +161,7 @@ Rules:
                 )
                 continue
 
+            # Check required fields
             missing_fields = [
                 field
                 for field in required_fields
@@ -133,6 +175,7 @@ Rules:
                 )
                 continue
 
+            # Check claim
             if not str(item["claim"]).strip():
                 print(
                     f"Skipping evidence item {index}: "
@@ -140,6 +183,7 @@ Rules:
                 )
                 continue
 
+            # Check excerpt
             if not str(item["excerpt"]).strip():
                 print(
                     f"Skipping evidence item {index}: "
@@ -147,6 +191,7 @@ Rules:
                 )
                 continue
 
+            # Check relevance score
             try:
                 relevance_score = float(
                     item["relevance_score"]
@@ -167,6 +212,9 @@ Rules:
                 )
                 continue
 
+            # --------------------------------------------------
+            # 9. Create Evidence object
+            # --------------------------------------------------
             evidence.append(
                 Evidence(
                     evidence_id=(
@@ -182,6 +230,9 @@ Rules:
                 )
             )
 
+        # --------------------------------------------------
+        # 10. Make sure at least one valid evidence item exists
+        # --------------------------------------------------
         if not evidence:
             raise ValueError(
                 "Extraction agent returned no valid evidence."

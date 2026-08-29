@@ -1,15 +1,4 @@
 import os
-
-from dotenv import load_dotenv
-from google import genai
-
-from ai.llm.base import LLM
-
-
-load_dotenv()
-
-api_key = os.getenv("GOOGLE_API_KEY")
-import os
 import time
 
 from dotenv import load_dotenv
@@ -40,7 +29,7 @@ class GeminiLLM(LLM):
     def generate(self, prompt: str) -> str:
 
         # --------------------------------------------------
-        # 1. Try primary model
+        # 1. Try primary model twice
         # --------------------------------------------------
         for attempt in range(2):
             try:
@@ -53,6 +42,9 @@ class GeminiLLM(LLM):
                     model=self.primary_model,
                     contents=prompt
                 )
+
+                if not response.text:
+                    raise RuntimeError("Gemini returned an empty response.")
 
                 print("Primary Gemini model succeeded.")
                 return response.text
@@ -68,7 +60,7 @@ class GeminiLLM(LLM):
                     time.sleep(5)
 
         # --------------------------------------------------
-        # 2. Primary failed twice → fallback model
+        # 2. Fallback model
         # --------------------------------------------------
         print(
             f"Primary model unavailable. "
@@ -81,6 +73,9 @@ class GeminiLLM(LLM):
                 contents=prompt
             )
 
+            if not response.text:
+                raise RuntimeError("Gemini returned an empty response.")
+
             print("Fallback Gemini model succeeded.")
             return response.text
 
@@ -91,20 +86,3 @@ class GeminiLLM(LLM):
                 "Gemini is temporarily unavailable. "
                 "Please try the research again later."
             )
-if not api_key:
-    raise ValueError("GOOGLE_API_KEY is not set")
-
-
-class GeminiLLM(LLM):
-
-    def __init__(self):
-        self.client = genai.Client(api_key=api_key)
-        self.model_name = "gemini-3.5-flash-lite"
-
-    def generate(self, prompt: str) -> str:
-        response = self.client.models.generate_content(
-            model=self.model_name,
-            contents=prompt
-        )
-
-        return response.text
