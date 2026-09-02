@@ -1,0 +1,11 @@
+step 1). Activate virtual enviroment .venv:
+    .\. venv \scripts\Activate.ps1
+2). Install FastAPI and Uvicorn
+    pip install fast api and Uvicorn
+3). created a FastAPI and main.py file
+    Code on main.py
+4). start the server
+    uvicorn main:app --reload
+    got http://127.0.0.1:8000
+5). open the browser
+    http://127.0.0.1:8000/health a message will appear
