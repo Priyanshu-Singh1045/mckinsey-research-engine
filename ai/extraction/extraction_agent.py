@@ -8,8 +8,8 @@ from ai.schemas.source import Source
 
 logger = logging.getLogger(__name__)
 
-# Number of sources processed in one Gemini request
-BATCH_SIZE = 5
+# Limit content sent to Gemini to reduce token usage
+MAX_CONTENT_LENGTH = 4000
 
 
 class ExtractionAgent:
@@ -19,66 +19,48 @@ class ExtractionAgent:
         self.browser = browser or TavilySearchEngine()
 
     # -------------------------------------------------------
-    # Existing single-source extraction (kept for compatibility)
+    # Extract evidence from a single source
     # -------------------------------------------------------
 
     def extract(self, source: Source) -> list[Evidence]:
-        return self.extract_batch([source])
 
-    # -------------------------------------------------------
-    # New batch extraction
-    # -------------------------------------------------------
-
-    def extract_batch(self, sources: list[Source]) -> list[Evidence]:
-        """
-        Extract evidence from multiple sources in a single Gemini call.
-
-        This reduces API usage significantly while keeping the output format
-        identical.
-        """
-
-        urls = [source.url for source in sources]
-
-        extracted = self.browser.extract(urls)
+        extracted = self.browser.extract([source.url])
 
         if not extracted:
             return []
 
-        source_blocks = []
+        content = extracted[0].get("raw_content", "")
 
-        for source, extracted_item in zip(sources, extracted):
-            content = extracted_item.get("raw_content", "")
-
-            if not content:
-                continue
-
-            source_blocks.append(
-                f"""
-SOURCE_ID: {source.source_id}
-TITLE: {source.title}
-URL: {source.url}
-
-CONTENT:
-{content[:6000]}
-"""
-            )
-
-        if not source_blocks:
+        if not content:
             return []
+
+        # Reduce token usage
+        content = content[:MAX_CONTENT_LENGTH]
 
         prompt = f"""
 You are an evidence extraction agent.
 
-Analyze ALL of the following sources.
+Analyze the following source.
+
+SOURCE ID:
+{source.source_id}
+
+SOURCE TITLE:
+{source.title}
+
+SOURCE URL:
+{source.url}
+
+CONTENT:
+{content}
+
+Extract ONLY the 3 most important factual claims supported by this content.
 
 Return ONLY valid JSON.
 
-Return a JSON array using exactly this structure:
-
 [
   {{
-    "source_id": "source_001",
-    "claim": "A concise factual claim",
+    "claim": "Short factual claim",
     "excerpt": "Short supporting excerpt",
     "entity": "Main entity",
     "topic": "Research topic",
@@ -87,60 +69,46 @@ Return a JSON array using exactly this structure:
 ]
 
 Rules:
-- Extract 2-5 factual claims from each source.
-- Every evidence item MUST contain source_id.
+- Maximum 3 evidence items.
 - Excerpts must come directly from the content.
 - Do not invent facts.
-- Return ONLY JSON.
-
-{"".join(source_blocks)}
+- relevance_score between 0 and 1.
+- Return only JSON.
 """
 
         response = self.llm.generate(prompt)
 
         if not response:
-            raise ValueError(
-                "Extraction agent received an empty response from Gemini."
-            )
+            raise ValueError("Extraction agent received an empty response.")
 
         cleaned_response = self._clean_response(response)
 
         try:
             data = json.loads(cleaned_response)
         except json.JSONDecodeError as e:
-            logger.error("Invalid Gemini JSON response during extraction.")
+            logger.error("Invalid Gemini JSON response.")
             logger.error(cleaned_response)
             raise ValueError("Extraction agent returned invalid JSON.") from e
 
         if not isinstance(data, list):
-            raise ValueError("Expected JSON array from extraction agent.")
-
-        source_lookup = {
-            source.source_id: source for source in sources
-        }
+            raise ValueError("Extraction agent expected a JSON array.")
 
         evidences = []
 
-        for item in data:
+        required_fields = [
+            "claim",
+            "excerpt",
+            "entity",
+            "topic",
+            "relevance_score",
+        ]
+
+        for index, item in enumerate(data, start=1):
 
             if not isinstance(item, dict):
                 continue
 
-            required_fields = [
-                "source_id",
-                "claim",
-                "excerpt",
-                "entity",
-                "topic",
-                "relevance_score",
-            ]
-
             if any(field not in item for field in required_fields):
-                continue
-
-            source = source_lookup.get(item["source_id"])
-
-            if source is None:
                 continue
 
             try:
@@ -150,13 +118,9 @@ Rules:
 
             score = max(0.0, min(score, 1.0))
 
-            evidence_id = (
-                f"{source.source_id}_evidence_{len(evidences)+1:03d}"
-            )
-
             evidences.append(
                 Evidence(
-                    evidence_id=evidence_id,
+                    evidence_id=f"{source.source_id}_evidence_{index:03d}",
                     claim=item["claim"].strip(),
                     excerpt=item["excerpt"].strip(),
                     entity=item["entity"].strip(),
@@ -167,23 +131,23 @@ Rules:
             )
 
         if not evidences:
-            raise ValueError(
-                "Extraction agent returned no valid evidence."
-            )
+            raise ValueError("Extraction agent returned no valid evidence.")
 
         logger.info(
-            f"Extraction completed: {len(evidences)} evidence items "
-            f"from {len(sources)} sources."
+            "Extraction completed: %d evidence items from source %s.",
+            len(evidences),
+            source.source_id,
         )
 
         return evidences
 
     # -------------------------------------------------------
-    # Response Cleaner
+    # Clean Gemini response
     # -------------------------------------------------------
 
     @staticmethod
     def _clean_response(response: str) -> str:
+
         cleaned = response.strip()
 
         if cleaned.startswith("```"):
