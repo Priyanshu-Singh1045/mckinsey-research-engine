@@ -1,9 +1,15 @@
 import json
+import logging
 
 from ai.llm.gemini import GeminiLLM
 from ai.schemas.evidence import Evidence
 from ai.schemas.source import Source
 from ai.schemas.validation import ValidationResult
+
+logger = logging.getLogger(__name__)
+
+# Number of evidence items validated in one Gemini request
+VALIDATION_BATCH_SIZE = 20
 
 
 class ValidationAgent:
@@ -11,11 +17,18 @@ class ValidationAgent:
     def __init__(self, llm=None):
         self.llm = llm or GeminiLLM()
 
+    # -------------------------------------------------------
+    # Public Validation Method
+    # -------------------------------------------------------
+
     def validate(
         self,
         evidences: list[Evidence],
-        sources: list[Source]
+        sources: list[Source],
     ) -> list[ValidationResult]:
+        """
+        Validate evidence in batches to reduce Gemini token usage.
+        """
 
         if not evidences:
             return []
@@ -24,6 +37,41 @@ class ValidationAgent:
             source.source_id: source
             for source in sources
         }
+
+        all_results = []
+
+        for start in range(0, len(evidences), VALIDATION_BATCH_SIZE):
+
+            batch = evidences[start:start + VALIDATION_BATCH_SIZE]
+
+            logger.info(
+                f"Validating evidence batch "
+                f"{start + 1}-{start + len(batch)} "
+                f"of {len(evidences)}"
+            )
+
+            batch_results = self._validate_batch(
+                batch,
+                source_map,
+            )
+
+            all_results.extend(batch_results)
+
+        logger.info(
+            f"Validation completed: {len(all_results)} evidence results."
+        )
+
+        return all_results
+
+    # -------------------------------------------------------
+    # Batch Validation
+    # -------------------------------------------------------
+
+    def _validate_batch(
+        self,
+        evidences: list[Evidence],
+        source_map: dict,
+    ) -> list[ValidationResult]:
 
         evidence_data = []
 
@@ -39,114 +87,117 @@ class ValidationAgent:
                     "entity": evidence.entity,
                     "topic": evidence.topic,
                     "relevance_score": evidence.relevance_score,
-                    "source_id": evidence.source_id,
-                    "source_title": source.title if source else None,
-                    "source_url": source.url if source else None,
-                    "source_type": source.source_type if source else None,
-                    "publisher": source.publisher if source else None,
-                    "published_date": source.published_date if source else None,
+                    "source_title": source.title if source else "",
+                    "source_type": source.source_type if source else "",
+                    "publisher": source.publisher if source else "",
+                    "published_date": (
+                        source.published_date if source else ""
+                    ),
                 }
             )
 
         prompt = f"""
 You are a research evidence validation agent.
 
-Your job is to evaluate research evidence extracted from web sources.
+Evaluate each evidence item using ONLY the supplied information.
 
-Review each evidence item carefully.
+Return ONLY valid JSON.
 
-EVIDENCE:
-
+Evidence:
 {json.dumps(evidence_data, indent=2)}
-
-For each evidence item evaluate:
-
-1. is_valid
-   - True if the claim is supported by the provided excerpt.
-   - False if the claim is unsupported, misleading, or cannot be determined.
-
-2. credibility_score
-   - Score from 0 to 1.
-   - Consider the type and publisher of the source.
-   - Do not use outside knowledge to verify the claim.
-
-3. recency_score
-   - Score from 0 to 1.
-   - Use the published date when available.
-   - More recent information should generally receive a higher score.
-   - If the publication date is unavailable, use a reasonable neutral score.
-
-4. is_duplicate
-   - True if another evidence item makes essentially the same claim.
-   - Otherwise false.
-
-5. has_conflict
-   - True if another evidence item contradicts this claim.
-   - Otherwise false.
-
-6. reason
-   - Give a short explanation for the validation result.
-
-IMPORTANT RULES:
-
-- Use only the information provided above.
-- Do not invent facts.
-- Do not perform outside research.
-- Return one validation result for every evidence item.
-- credibility_score must be between 0 and 1.
-- recency_score must be between 0 and 1.
-- Return ONLY valid JSON.
-- Do not use Markdown.
-- Do not include ```json.
-- Do not include any explanation outside the JSON.
 
 Return exactly this structure:
 
 [
-    {{
-        "evidence_id": "evidence_001",
-        "is_valid": true,
-        "credibility_score": 0.85,
-        "recency_score": 0.90,
-        "is_duplicate": false,
-        "has_conflict": false,
-        "reason": "The claim is directly supported by the provided excerpt."
-    }}
+  {{
+    "evidence_id":"...",
+    "is_valid":true,
+    "credibility_score":0.85,
+    "recency_score":0.90,
+    "is_duplicate":false,
+    "has_conflict":false,
+    "reason":"Short explanation."
+  }}
 ]
+
+Rules:
+- Use only supplied evidence.
+- Do not invent facts.
+- credibility_score must be between 0 and 1.
+- recency_score must be between 0 and 1.
+- Return one result for every evidence item.
+- Return JSON only.
 """
 
         response = self.llm.generate(prompt)
 
+        cleaned_response = self._clean_response(response)
+
         try:
-            response = response.strip()
+            data = json.loads(cleaned_response)
 
-            if response.startswith("```"):
-                response = response.replace("```json", "")
-                response = response.replace("```", "")
-                response = response.strip()
-
-            data = json.loads(response)
-
-            results = []
-
-            for item in data:
-
-                result = ValidationResult(
-                    evidence_id=item["evidence_id"],
-                    is_valid=bool(item["is_valid"]),
-                    credibility_score=float(item["credibility_score"]),
-                    recency_score=float(item["recency_score"]),
-                    is_duplicate=bool(item["is_duplicate"]),
-                    has_conflict=bool(item["has_conflict"]),
-                    reason=item["reason"]
-                )
-
-                results.append(result)
-
-            return results
-
-        except Exception as e:
+        except json.JSONDecodeError as e:
+            logger.error("Invalid validation JSON returned by Gemini.")
+            logger.error(cleaned_response)
 
             raise ValueError(
-                "Validation agent returned invalid validation results"
+                "Validation agent returned invalid validation JSON."
             ) from e
+
+        results = []
+
+        for item in data:
+
+            try:
+                results.append(
+                    ValidationResult(
+                        evidence_id=item["evidence_id"],
+                        is_valid=bool(item["is_valid"]),
+                        credibility_score=max(
+                            0.0,
+                            min(float(item["credibility_score"]), 1.0),
+                        ),
+                        recency_score=max(
+                            0.0,
+                            min(float(item["recency_score"]), 1.0),
+                        ),
+                        is_duplicate=bool(item["is_duplicate"]),
+                        has_conflict=bool(item["has_conflict"]),
+                        reason=str(item["reason"]).strip(),
+                    )
+                )
+
+            except KeyError:
+                logger.warning(
+                    f"Skipping malformed validation item: {item}"
+                )
+
+        return results
+
+    # -------------------------------------------------------
+    # Response Cleaner
+    # -------------------------------------------------------
+
+    @staticmethod
+    def _clean_response(response: str) -> str:
+
+        cleaned = response.strip()
+
+        if cleaned.startswith("```"):
+            lines = cleaned.splitlines()
+
+            if lines and lines[0].startswith("```"):
+                lines = lines[1:]
+
+            if lines and lines[-1].startswith("```"):
+                lines = lines[:-1]
+
+            cleaned = "\n".join(lines).strip()
+
+        start = cleaned.find("[")
+        end = cleaned.rfind("]")
+
+        if start != -1 and end != -1:
+            cleaned = cleaned[start:end + 1]
+
+        return cleaned
