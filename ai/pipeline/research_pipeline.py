@@ -1,5 +1,6 @@
 import time
 import logging
+import re
 
 from google.genai.errors import ServerError, ClientError
 
@@ -19,13 +20,13 @@ from ai.schemas.validation import ValidationResult
 
 logger = logging.getLogger(__name__)
 
-# -------------------------------------------------------
-# Gemini Retry Configuration
-# -------------------------------------------------------
+# ==========================================================
+# Retry Configuration
+# ==========================================================
 
 MAX_GEMINI_RETRIES = 5
-INITIAL_BACKOFF = 2  # seconds
-REQUEST_DELAY = 0.5  # seconds between Gemini requests
+INITIAL_BACKOFF = 2
+REQUEST_DELAY = 0.5
 
 
 class ResearchPipeline:
@@ -47,109 +48,158 @@ class ResearchPipeline:
         self.citation_builder = citation_builder or CitationBuilder()
         self.report_linker = report_linker or ReportLinker()
 
-    # -------------------------------------------------------
-    # Generic Gemini Retry Wrapper
-    # -------------------------------------------------------
+    # ==========================================================
+    # Extract Retry Delay from Gemini Error
+    # ==========================================================
 
-    def _run_with_retry(self, func, stage_name, item_name):
+    @staticmethod
+    def _extract_retry_delay(error: Exception) -> int | None:
         """
-        Executes a Gemini-dependent function with retry logic.
+        Extract retry delay from Gemini RetryInfo.
 
-        Retries only on retryable HTTP status codes:
-        429, 500, 502, 503, 504.
+        Example message:
+        retryDelay: '12s'
         """
 
-        retryable_codes = {429, 500, 502, 503, 504}
+        text = str(error)
+
+        match = re.search(r"retryDelay['\"]?:\\s*['\"]?(\\d+)s", text)
+
+        if match:
+            return int(match.group(1))
+
+        return None
+
+    # ==========================================================
+    # Generic Retry Wrapper
+    # ==========================================================
+
+    def _run_with_retry(self, func, stage_name: str, item_name: str):
+        """
+        Retry Gemini operations on retryable HTTP errors.
+        """
+
+        retryable_codes = ["429", "500", "502", "503", "504"]
 
         for attempt in range(1, MAX_GEMINI_RETRIES + 1):
+
             try:
                 logger.info(
-                    f"{stage_name}: Processing {item_name} "
-                    f"(Attempt {attempt}/{MAX_GEMINI_RETRIES})"
+                    "%s: Processing %s (Attempt %s/%s)",
+                    stage_name,
+                    item_name,
+                    attempt,
+                    MAX_GEMINI_RETRIES,
                 )
+
                 return func()
 
-            except (ServerError, ClientError) as e:
-                error_code = getattr(e, "code", None)
+            except (ServerError, ClientError, RuntimeError) as e:
 
-                if error_code not in retryable_codes:
-                    logger.error(
-                        f"{stage_name}: Non-retryable Gemini error "
-                        f"({error_code}) while processing {item_name}: {e}"
+                error_text = str(e)
+
+                retryable = any(code in error_text for code in retryable_codes)
+
+                if not retryable:
+                    logger.exception(
+                        "%s: Non-retryable Gemini error while processing %s",
+                        stage_name,
+                        item_name,
                     )
                     raise
 
                 if attempt == MAX_GEMINI_RETRIES:
                     logger.error(
-                        f"{stage_name}: Failed after "
-                        f"{MAX_GEMINI_RETRIES} retries for {item_name}"
+                        "%s: Failed after %s retries for %s",
+                        stage_name,
+                        MAX_GEMINI_RETRIES,
+                        item_name,
                     )
                     raise RuntimeError(
-                        "Gemini unavailable after multiple retries."
+                        "Gemini is temporarily unavailable after multiple retries. Please retry in a few minutes."
                     ) from e
 
-                wait_time = INITIAL_BACKOFF * (2 ** (attempt - 1))
+                retry_delay = self._extract_retry_delay(e)
+
+                if retry_delay:
+                    wait_time = retry_delay
+                else:
+                    wait_time = INITIAL_BACKOFF * (2 ** (attempt - 1))
 
                 logger.warning(
-                    f"{stage_name}: Gemini returned HTTP {error_code}. "
-                    f"Retrying {item_name} in {wait_time}s "
-                    f"({attempt}/{MAX_GEMINI_RETRIES})"
+                    "%s: Retryable Gemini error while processing %s. "
+                    "Waiting %ss before retry (%s/%s). Error: %s",
+                    stage_name,
+                    item_name,
+                    wait_time,
+                    attempt,
+                    MAX_GEMINI_RETRIES,
+                    error_text,
                 )
 
                 time.sleep(wait_time)
 
-    # -------------------------------------------------------
+    # ==========================================================
     # Main Pipeline
-    # -------------------------------------------------------
+    # ==========================================================
 
     def run(self, query: str) -> ResearchResult:
+
         pipeline_start = time.time()
 
         try:
 
-            # =====================================================
+            # ------------------------------------------------------
             # STEP 1 — Planner
-            # =====================================================
+            # ------------------------------------------------------
 
             logger.info("========== PLANNER STAGE ==========")
+
             start = time.time()
 
-            tasks: list[ResearchTask] = self.planner.create_plan(query)
+            tasks: list[ResearchTask] = self._run_with_retry(
+                lambda: self.planner.create_plan(query),
+                stage_name="Planner",
+                item_name="Research Plan",
+            )
 
             if not tasks:
                 raise ValueError("Planner returned no research tasks.")
 
             logger.info(
-                f"Planner generated {len(tasks)} research tasks "
-                f"in {time.time() - start:.2f}s."
+                "Planner generated %s research tasks in %.2fs.",
+                len(tasks),
+                time.time() - start,
             )
 
-            # =====================================================
+            # ------------------------------------------------------
             # STEP 2 — Research
-            # =====================================================
+            # ------------------------------------------------------
 
             logger.info("========== RESEARCH STAGE ==========")
+
             start = time.time()
 
             sources: list[Source] = []
 
             for task in tasks:
-                task_sources = self.researcher.research(task)
-                sources.extend(task_sources)
+                sources.extend(self.researcher.research(task))
 
             if not sources:
                 raise ValueError("Research agent returned no sources.")
 
             logger.info(
-                f"Research found {len(sources)} sources "
-                f"in {time.time() - start:.2f}s."
+                "Research found %s sources in %.2fs.",
+                len(sources),
+                time.time() - start,
             )
 
-            # =====================================================
+            # ------------------------------------------------------
             # STEP 3 — Extraction
-            # =====================================================
+            # ------------------------------------------------------
 
             logger.info("========== EXTRACTION STAGE ==========")
+
             start = time.time()
 
             evidences: list[Evidence] = []
@@ -164,7 +214,6 @@ class ResearchPipeline:
 
                 evidences.extend(source_evidence)
 
-                # Prevent burst requests to Gemini.
                 if index < len(sources):
                     time.sleep(REQUEST_DELAY)
 
@@ -172,19 +221,20 @@ class ResearchPipeline:
                 raise ValueError("Extraction agent returned no evidence.")
 
             logger.info(
-                f"Extraction produced {len(evidences)} evidence items "
-                f"in {time.time() - start:.2f}s."
+                "Extraction produced %s evidence items in %.2fs.",
+                len(evidences),
+                time.time() - start,
             )
 
-            # =====================================================
+            # ------------------------------------------------------
             # STEP 4 — Validation
-            # =====================================================
+            # ------------------------------------------------------
 
             logger.info("========== VALIDATION STAGE ==========")
+
             start = time.time()
 
-            # Small delay before sending validation request.
-            time.sleep(REQUEST_DELAY)
+            time.sleep(2)
 
             validations: list[ValidationResult] = self._run_with_retry(
                 lambda: self.validator.validate(
@@ -196,20 +246,20 @@ class ResearchPipeline:
             )
 
             if not validations:
-                raise ValueError(
-                    "Validation agent returned no validation results."
-                )
+                raise ValueError("Validation agent returned no validation results.")
 
             logger.info(
-                f"Validation produced {len(validations)} results "
-                f"in {time.time() - start:.2f}s."
+                "Validation produced %s results in %.2fs.",
+                len(validations),
+                time.time() - start,
             )
 
-            # =====================================================
+            # ------------------------------------------------------
             # STEP 5 — Citation Builder
-            # =====================================================
+            # ------------------------------------------------------
 
             logger.info("========== CITATION STAGE ==========")
+
             start = time.time()
 
             citations = self.citation_builder.build(sources)
@@ -218,16 +268,20 @@ class ResearchPipeline:
                 raise ValueError("Citation builder returned no citations.")
 
             logger.info(
-                f"Generated {len(citations)} citations "
-                f"in {time.time() - start:.2f}s."
+                "Generated %s citations in %.2fs.",
+                len(citations),
+                time.time() - start,
             )
 
-            # =====================================================
+            # ------------------------------------------------------
             # STEP 6 — Report Generation
-            # =====================================================
+            # ------------------------------------------------------
 
             logger.info("========== REPORT STAGE ==========")
+
             start = time.time()
+
+            time.sleep(2)
 
             if len(evidences) > 20:
                 try:
@@ -256,14 +310,16 @@ class ResearchPipeline:
                 raise ValueError("Report agent returned no report.")
 
             logger.info(
-                f"Report generated in {time.time() - start:.2f}s."
+                "Report generated in %.2fs.",
+                time.time() - start,
             )
 
-            # =====================================================
+            # ------------------------------------------------------
             # STEP 7 — Report Linking
-            # =====================================================
+            # ------------------------------------------------------
 
             logger.info("========== REPORT LINKER STAGE ==========")
+
             start = time.time()
 
             linked_report = self.report_linker.link_report(
@@ -273,18 +329,17 @@ class ResearchPipeline:
             )
 
             if not linked_report:
-                raise ValueError(
-                    "Report linker returned no linked report."
-                )
+                raise ValueError("Report linker returned no linked report.")
 
             logger.info(
-                f"Linked {len(linked_report.key_findings)} key findings "
-                f"in {time.time() - start:.2f}s."
+                "Linked %s key findings in %.2fs.",
+                len(linked_report.key_findings),
+                time.time() - start,
             )
 
             logger.info(
-                f"Pipeline completed successfully in "
-                f"{time.time() - pipeline_start:.2f}s."
+                "Pipeline completed successfully in %.2fs.",
+                time.time() - pipeline_start,
             )
 
             return ResearchResult(
@@ -296,31 +351,23 @@ class ResearchPipeline:
                 validations=validations,
             )
 
-        # -------------------------------------------------------
-        # Gemini Retry Failure
-        # -------------------------------------------------------
+        # ------------------------------------------------------
+        # Final Gemini Failure
+        # ------------------------------------------------------
 
         except RuntimeError:
+            logger.exception("Pipeline stopped because Gemini remained unavailable.")
             raise
-
-        # -------------------------------------------------------
-        # Gemini API Errors
-        # -------------------------------------------------------
 
         except (ServerError, ClientError) as e:
             logger.exception("Unhandled Gemini API error.")
-
             raise RuntimeError(
                 "Gemini is temporarily unavailable. Please retry."
             ) from e
 
-        # -------------------------------------------------------
-        # Other Pipeline Errors
-        # -------------------------------------------------------
-
         except Exception:
             logger.exception(
-                f"Research pipeline failed after "
-                f"{time.time() - pipeline_start:.2f}s."
+                "Research pipeline failed after %.2fs.",
+                time.time() - pipeline_start,
             )
             raise
