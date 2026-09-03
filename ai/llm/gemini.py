@@ -25,7 +25,7 @@ if not api_key:
 # Retry Configuration
 # =======================================================
 
-MAX_MODEL_RETRIES = 5
+MAX_MODEL_RETRIES = 3
 DEFAULT_BACKOFF = 2  # Seconds
 
 # =======================================================
@@ -39,7 +39,7 @@ class GeminiLLM(LLM):
 
     Features
     --------
-    - Uses Gemini Chat API (avoids direct Models.generate_content usage).
+    - Uses Gemini Chat API.
     - Primary model + multiple fallback models.
     - Automatic retry for temporary Gemini failures.
     - Handles 429 quota errors using Gemini RetryInfo delay.
@@ -50,21 +50,20 @@ class GeminiLLM(LLM):
         self.client = genai.Client(api_key=api_key)
 
         # -------------------------------------------------------
-        # Model Configuration
+        # Model Configuration (Best → Weakest)
         # -------------------------------------------------------
 
-        # Primary model (fast + low token usage)
-        self.primary_model = "gemini-3.7-flash"
+        self.primary_model = "gemini-3.5-flash"
 
-        # Fallback models (tried in order)
         self.fallback_models = [
-            "gemini-3.5-flash",
-            "gemini-3.1-flash-lite",
+            "gemini-2.5-flash",
+            "gemini-2.5-flash-lite",
         ]
 
         logger.info(
-            f"Primary Gemini model: {self.primary_model} | "
-            f"Fallback models: {', '.join(self.fallback_models)}"
+            "Primary Gemini model: %s | Fallback models: %s",
+            self.primary_model,
+            ", ".join(self.fallback_models),
         )
 
     # =======================================================
@@ -72,9 +71,7 @@ class GeminiLLM(LLM):
     # =======================================================
 
     def _chat_generate(self, model: str, prompt: str) -> str:
-        """
-        Sends a prompt using Gemini Chat API.
-        """
+        """Send prompt using Gemini Chat API."""
 
         chat = self.client.chats.create(model=model)
 
@@ -90,9 +87,7 @@ class GeminiLLM(LLM):
     # =======================================================
 
     def _generate_with_retry(self, model: str, prompt: str) -> str:
-        """
-        Retry Gemini request on temporary failures.
-        """
+        """Retry Gemini request on temporary failures."""
 
         last_error = None
 
@@ -100,8 +95,10 @@ class GeminiLLM(LLM):
 
             try:
                 logger.info(
-                    f"Using Gemini model: {model} "
-                    f"(Attempt {attempt}/{MAX_MODEL_RETRIES})"
+                    "Using Gemini model: %s (Attempt %d/%d)",
+                    model,
+                    attempt,
+                    MAX_MODEL_RETRIES,
                 )
 
                 return self._chat_generate(model=model, prompt=prompt)
@@ -113,22 +110,21 @@ class GeminiLLM(LLM):
 
                 retryable = any(
                     keyword in error_text
-                    for keyword in [
+                    for keyword in (
                         "429",
                         "RESOURCE_EXHAUSTED",
                         "503",
                         "UNAVAILABLE",
                         "500",
                         "INTERNAL",
-                    ]
+                    )
                 )
 
-                # Non-retryable errors
                 if not retryable:
-                    logger.error(f"Non-retryable Gemini error ({model}): {e}")
+                    logger.error("Non-retryable Gemini error (%s): %s", model, e)
                     raise
 
-                # Gemini sometimes tells us exactly how long to wait.
+                # Read Gemini RetryInfo (429 errors)
                 retry_match = re.search(
                     r"retry in ([0-9.]+)s",
                     error_text,
@@ -141,20 +137,19 @@ class GeminiLLM(LLM):
                     wait_time = DEFAULT_BACKOFF * (2 ** (attempt - 1))
 
                 if attempt < MAX_MODEL_RETRIES:
-
                     logger.warning(
-                        f"{model} unavailable "
-                        f"(Attempt {attempt}/{MAX_MODEL_RETRIES}). "
-                        f"Retrying in {wait_time:.1f}s..."
+                        "%s unavailable (Attempt %d/%d). Retrying in %.1fs...",
+                        model,
+                        attempt,
+                        MAX_MODEL_RETRIES,
+                        wait_time,
                     )
-
                     time.sleep(wait_time)
-
                 else:
-
                     logger.error(
-                        f"{model} failed after "
-                        f"{MAX_MODEL_RETRIES} attempts."
+                        "%s failed after %d attempts.",
+                        model,
+                        MAX_MODEL_RETRIES,
                     )
 
         raise last_error
@@ -165,12 +160,12 @@ class GeminiLLM(LLM):
 
     def generate(self, prompt: str) -> str:
         """
-        Generate text using the primary model and fallback models.
+        Generate text using primary model and fallback models.
 
         Order:
-            1. Gemini 3.1 Flash Lite
-            2. Gemini 3.5 Flash
-            3. Gemini 3.7 Flash
+        1. gemini-3.5-flash
+        2. gemini-2.5-flash
+        3. gemini-2.5-flash-lite
         """
 
         models = [self.primary_model] + self.fallback_models
@@ -178,21 +173,16 @@ class GeminiLLM(LLM):
         last_error = None
 
         for model in models:
-
             try:
                 return self._generate_with_retry(model, prompt)
 
             except Exception as e:
-
                 last_error = e
 
                 logger.warning(
-                    f"Model {model} failed. Trying next fallback model..."
+                    "Model %s failed. Trying next fallback model...",
+                    model,
                 )
-
-        # ---------------------------------------------------
-        # All models failed
-        # ---------------------------------------------------
 
         error_text = str(last_error)
 
