@@ -21,12 +21,16 @@ from ai.schemas.validation import ValidationResult
 logger = logging.getLogger(__name__)
 
 # ==========================================================
-# Retry Configuration
+# Retry & Pipeline Configuration
 # ==========================================================
 
-MAX_GEMINI_RETRIES = 5
-INITIAL_BACKOFF = 2
-REQUEST_DELAY = 0.5
+MAX_GEMINI_RETRIES = 3          # Reduced from 5
+INITIAL_BACKOFF = 2             # Seconds
+REQUEST_DELAY = 1.0             # Delay between Gemini requests
+
+MAX_EXTRACTION_SOURCES = 6       # Extract only from best 6 sources
+MAX_VALIDATION_EVIDENCE = 30     # Validate top 30 evidence
+MAX_REPORT_EVIDENCE = 20         # Report uses top 20 evidence
 
 
 class ResearchPipeline:
@@ -53,17 +57,17 @@ class ResearchPipeline:
     # ==========================================================
 
     @staticmethod
-    def _extract_retry_delay(error: Exception) -> int | None:
+    def _extract_retry_delay(error: Exception):
         """
         Extract retry delay from Gemini RetryInfo.
 
-        Example message:
-        retryDelay: '12s'
+        Example:
+            retryDelay: "12s"
         """
 
         text = str(error)
 
-        match = re.search(r"retryDelay['\"]?:\\s*['\"]?(\\d+)s", text)
+        match = re.search(r"retryDelay['\"]?:\s*['\"]?(\d+)s", text)
 
         if match:
             return int(match.group(1))
@@ -76,7 +80,10 @@ class ResearchPipeline:
 
     def _run_with_retry(self, func, stage_name: str, item_name: str):
         """
-        Retry Gemini operations on retryable HTTP errors.
+        Retry Gemini operations on retryable errors.
+
+        Retryable:
+        429, 500, 502, 503, 504
         """
 
         retryable_codes = ["429", "500", "502", "503", "504"]
@@ -85,7 +92,7 @@ class ResearchPipeline:
 
             try:
                 logger.info(
-                    "%s: Processing %s (Attempt %s/%s)",
+                    "%s: Processing %s (Attempt %d/%d)",
                     stage_name,
                     item_name,
                     attempt,
@@ -98,7 +105,9 @@ class ResearchPipeline:
 
                 error_text = str(e)
 
-                retryable = any(code in error_text for code in retryable_codes)
+                retryable = any(
+                    code in error_text for code in retryable_codes
+                )
 
                 if not retryable:
                     logger.exception(
@@ -110,7 +119,7 @@ class ResearchPipeline:
 
                 if attempt == MAX_GEMINI_RETRIES:
                     logger.error(
-                        "%s: Failed after %s retries for %s",
+                        "%s: Failed after %d retries for %s",
                         stage_name,
                         MAX_GEMINI_RETRIES,
                         item_name,
@@ -127,8 +136,7 @@ class ResearchPipeline:
                     wait_time = INITIAL_BACKOFF * (2 ** (attempt - 1))
 
                 logger.warning(
-                    "%s: Retryable Gemini error while processing %s. "
-                    "Waiting %ss before retry (%s/%s). Error: %s",
+                    "%s: Retryable Gemini error while processing %s. Waiting %.1fs before retry (%d/%d). Error: %s",
                     stage_name,
                     item_name,
                     wait_time,
@@ -140,7 +148,7 @@ class ResearchPipeline:
                 time.sleep(wait_time)
 
     # ==========================================================
-    # Main Pipeline
+    # Main Research Pipeline
     # ==========================================================
 
     def run(self, query: str) -> ResearchResult:
@@ -149,13 +157,13 @@ class ResearchPipeline:
 
         try:
 
-            # ------------------------------------------------------
+            # ======================================================
             # STEP 1 — Planner
-            # ------------------------------------------------------
+            # ======================================================
 
             logger.info("========== PLANNER STAGE ==========")
 
-            start = time.time()
+            stage_start = time.time()
 
             tasks: list[ResearchTask] = self._run_with_retry(
                 lambda: self.planner.create_plan(query),
@@ -167,18 +175,18 @@ class ResearchPipeline:
                 raise ValueError("Planner returned no research tasks.")
 
             logger.info(
-                "Planner generated %s research tasks in %.2fs.",
+                "Planner generated %d research tasks in %.2fs.",
                 len(tasks),
-                time.time() - start,
+                time.time() - stage_start,
             )
 
-            # ------------------------------------------------------
+            # ======================================================
             # STEP 2 — Research
-            # ------------------------------------------------------
+            # ======================================================
 
             logger.info("========== RESEARCH STAGE ==========")
 
-            start = time.time()
+            stage_start = time.time()
 
             sources: list[Source] = []
 
@@ -189,56 +197,76 @@ class ResearchPipeline:
                 raise ValueError("Research agent returned no sources.")
 
             logger.info(
-                "Research found %s sources in %.2fs.",
+                "Research found %d sources in %.2fs.",
                 len(sources),
-                time.time() - start,
+                time.time() - stage_start,
             )
 
-            # ------------------------------------------------------
+            # ======================================================
             # STEP 3 — Extraction
-            # ------------------------------------------------------
+            # ======================================================
 
             logger.info("========== EXTRACTION STAGE ==========")
 
-            start = time.time()
+            stage_start = time.time()
 
             evidences: list[Evidence] = []
 
-            for index, source in enumerate(sources, start=1):
+            sources_to_extract = sources[:MAX_EXTRACTION_SOURCES]
+
+            logger.info(
+                "Extracting evidence from %d of %d sources.",
+                len(sources_to_extract),
+                len(sources),
+            )
+
+            for index, source in enumerate(sources_to_extract, start=1):
 
                 source_evidence = self._run_with_retry(
                     lambda s=source: self.extractor.extract(s),
                     stage_name="Extraction",
-                    item_name=f"Source {index}/{len(sources)}",
+                    item_name=f"Source {index}/{len(sources_to_extract)}",
                 )
 
                 evidences.extend(source_evidence)
 
-                if index < len(sources):
+                if index < len(sources_to_extract):
                     time.sleep(REQUEST_DELAY)
 
             if not evidences:
                 raise ValueError("Extraction agent returned no evidence.")
 
             logger.info(
-                "Extraction produced %s evidence items in %.2fs.",
+                "Extraction produced %d evidence items in %.2fs.",
                 len(evidences),
-                time.time() - start,
+                time.time() - stage_start,
             )
 
-            # ------------------------------------------------------
+            # ======================================================
             # STEP 4 — Validation
-            # ------------------------------------------------------
+            # ======================================================
 
             logger.info("========== VALIDATION STAGE ==========")
 
-            start = time.time()
+            stage_start = time.time()
 
-            time.sleep(2)
+            validation_evidence = sorted(
+                evidences,
+                key=lambda x: getattr(x, "relevance_score", 0),
+                reverse=True,
+            )[:MAX_VALIDATION_EVIDENCE]
+
+            logger.info(
+                "Validating top %d evidence items out of %d.",
+                len(validation_evidence),
+                len(evidences),
+            )
+
+            time.sleep(REQUEST_DELAY)
 
             validations: list[ValidationResult] = self._run_with_retry(
                 lambda: self.validator.validate(
-                    evidences=evidences,
+                    evidences=validation_evidence,
                     sources=sources,
                 ),
                 stage_name="Validation",
@@ -246,21 +274,23 @@ class ResearchPipeline:
             )
 
             if not validations:
-                raise ValueError("Validation agent returned no validation results.")
+                raise ValueError(
+                    "Validation agent returned no validation results."
+                )
 
             logger.info(
-                "Validation produced %s results in %.2fs.",
+                "Validation produced %d results in %.2fs.",
                 len(validations),
-                time.time() - start,
+                time.time() - stage_start,
             )
 
-            # ------------------------------------------------------
+            # ======================================================
             # STEP 5 — Citation Builder
-            # ------------------------------------------------------
+            # ======================================================
 
             logger.info("========== CITATION STAGE ==========")
 
-            start = time.time()
+            stage_start = time.time()
 
             citations = self.citation_builder.build(sources)
 
@@ -268,32 +298,29 @@ class ResearchPipeline:
                 raise ValueError("Citation builder returned no citations.")
 
             logger.info(
-                "Generated %s citations in %.2fs.",
+                "Generated %d citations in %.2fs.",
                 len(citations),
-                time.time() - start,
+                time.time() - stage_start,
             )
 
-            # ------------------------------------------------------
+            # ======================================================
             # STEP 6 — Report Generation
-            # ------------------------------------------------------
+            # ======================================================
 
             logger.info("========== REPORT STAGE ==========")
 
-            start = time.time()
+            stage_start = time.time()
 
-            time.sleep(2)
-
-            if len(evidences) > 20:
-                try:
-                    top_evidence = sorted(
-                        evidences,
-                        key=lambda x: getattr(x, "relevance_score", 0),
-                        reverse=True,
-                    )[:20]
-                except Exception:
-                    top_evidence = evidences[:20]
+            if len(validation_evidence) > MAX_REPORT_EVIDENCE:
+                top_evidence = sorted(
+                    validation_evidence,
+                    key=lambda x: getattr(x, "relevance_score", 0),
+                    reverse=True,
+                )[:MAX_REPORT_EVIDENCE]
             else:
-                top_evidence = evidences
+                top_evidence = validation_evidence
+
+            time.sleep(REQUEST_DELAY)
 
             report = self._run_with_retry(
                 lambda: self.reporter.generate_report(
@@ -311,16 +338,16 @@ class ResearchPipeline:
 
             logger.info(
                 "Report generated in %.2fs.",
-                time.time() - start,
+                time.time() - stage_start,
             )
 
-            # ------------------------------------------------------
+            # ======================================================
             # STEP 7 — Report Linking
-            # ------------------------------------------------------
+            # ======================================================
 
             logger.info("========== REPORT LINKER STAGE ==========")
 
-            start = time.time()
+            stage_start = time.time()
 
             linked_report = self.report_linker.link_report(
                 report=report,
@@ -329,12 +356,14 @@ class ResearchPipeline:
             )
 
             if not linked_report:
-                raise ValueError("Report linker returned no linked report.")
+                raise ValueError(
+                    "Report linker returned no linked report."
+                )
 
             logger.info(
-                "Linked %s key findings in %.2fs.",
+                "Linked %d key findings in %.2fs.",
                 len(linked_report.key_findings),
-                time.time() - start,
+                time.time() - stage_start,
             )
 
             logger.info(
@@ -351,16 +380,19 @@ class ResearchPipeline:
                 validations=validations,
             )
 
-        # ------------------------------------------------------
-        # Final Gemini Failure
-        # ------------------------------------------------------
+        # ======================================================
+        # Error Handling
+        # ======================================================
 
         except RuntimeError:
-            logger.exception("Pipeline stopped because Gemini remained unavailable.")
+            logger.exception(
+                "Pipeline stopped because Gemini remained unavailable."
+            )
             raise
 
         except (ServerError, ClientError) as e:
             logger.exception("Unhandled Gemini API error.")
+
             raise RuntimeError(
                 "Gemini is temporarily unavailable. Please retry."
             ) from e
