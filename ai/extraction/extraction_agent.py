@@ -1,9 +1,15 @@
 import json
+import logging
 
 from ai.browser.tavily_search import TavilySearchEngine
 from ai.llm.gemini import GeminiLLM
 from ai.schemas.evidence import Evidence
 from ai.schemas.source import Source
+
+logger = logging.getLogger(__name__)
+
+# Number of sources processed in one Gemini request
+BATCH_SIZE = 5
 
 
 class ExtractionAgent:
@@ -12,230 +18,189 @@ class ExtractionAgent:
         self.llm = llm or GeminiLLM()
         self.browser = browser or TavilySearchEngine()
 
-    def extract(self, source: Source) -> list[Evidence]:
+    # -------------------------------------------------------
+    # Existing single-source extraction (kept for compatibility)
+    # -------------------------------------------------------
 
-        # --------------------------------------------------
-        # 1. Extract content from the source
-        # --------------------------------------------------
-        extracted = self.browser.extract([source.url])
+    def extract(self, source: Source) -> list[Evidence]:
+        return self.extract_batch([source])
+
+    # -------------------------------------------------------
+    # New batch extraction
+    # -------------------------------------------------------
+
+    def extract_batch(self, sources: list[Source]) -> list[Evidence]:
+        """
+        Extract evidence from multiple sources in a single Gemini call.
+
+        This reduces API usage significantly while keeping the output format
+        identical.
+        """
+
+        urls = [source.url for source in sources]
+
+        extracted = self.browser.extract(urls)
 
         if not extracted:
             return []
 
-        content = extracted[0].get("raw_content", "")
+        source_blocks = []
 
-        if not content:
+        for source, extracted_item in zip(sources, extracted):
+            content = extracted_item.get("raw_content", "")
+
+            if not content:
+                continue
+
+            source_blocks.append(
+                f"""
+SOURCE_ID: {source.source_id}
+TITLE: {source.title}
+URL: {source.url}
+
+CONTENT:
+{content[:6000]}
+"""
+            )
+
+        if not source_blocks:
             return []
 
-        # --------------------------------------------------
-        # 2. Build extraction prompt
-        # --------------------------------------------------
         prompt = f"""
 You are an evidence extraction agent.
 
-Analyze the following source content.
-
-SOURCE ID:
-{source.source_id}
-
-SOURCE TITLE:
-{source.title}
-
-SOURCE URL:
-{source.url}
-
-CONTENT:
-{content}
-
-Extract the most useful factual claims from this source.
+Analyze ALL of the following sources.
 
 Return ONLY valid JSON.
 
 Return a JSON array using exactly this structure:
 
 [
-    {{
-        "claim": "A concise factual claim",
-        "excerpt": "A short excerpt supporting the claim",
-        "entity": "Main entity discussed",
-        "topic": "Research topic",
-        "relevance_score": 0.95
-    }}
+  {{
+    "source_id": "source_001",
+    "claim": "A concise factual claim",
+    "excerpt": "Short supporting excerpt",
+    "entity": "Main entity",
+    "topic": "Research topic",
+    "relevance_score": 0.95
+  }}
 ]
 
 Rules:
-- Extract only information supported by the provided content.
+- Extract 2-5 factual claims from each source.
+- Every evidence item MUST contain source_id.
+- Excerpts must come directly from the content.
 - Do not invent facts.
-- Do not use outside knowledge.
-- Every evidence item MUST contain an excerpt.
-- The excerpt MUST directly support the claim.
-- Keep excerpts short.
-- relevance_score must be between 0 and 1.
-- Return only JSON.
+- Return ONLY JSON.
+
+{"".join(source_blocks)}
 """
 
-        # --------------------------------------------------
-        # 3. Generate response from Gemini
-        # --------------------------------------------------
         response = self.llm.generate(prompt)
 
         if not response:
             raise ValueError(
-                "Extraction agent received an empty response from the LLM."
+                "Extraction agent received an empty response from Gemini."
             )
 
-        # --------------------------------------------------
-        # 4. Clean Gemini response
-        # --------------------------------------------------
-        cleaned_response = response.strip()
+        cleaned_response = self._clean_response(response)
 
-        # Remove Markdown code fences if Gemini returns:
-        #
-        # ```json
-        # [...]
-        # ```
-        if cleaned_response.startswith("```"):
-            lines = cleaned_response.splitlines()
-
-            if lines and lines[0].strip().startswith("```"):
-                lines = lines[1:]
-
-            if lines and lines[-1].strip() == "```":
-                lines = lines[:-1]
-
-            cleaned_response = "\n".join(lines).strip()
-
-        # --------------------------------------------------
-        # 5. Extract the JSON array
-        # --------------------------------------------------
-        # Sometimes Gemini may return extra text before or
-        # after the JSON. Find the first '[' and last ']'.
-        start = cleaned_response.find("[")
-        end = cleaned_response.rfind("]")
-
-        if start != -1 and end != -1 and start < end:
-            cleaned_response = cleaned_response[start:end + 1]
-
-        # --------------------------------------------------
-        # 6. Parse JSON
-        # --------------------------------------------------
         try:
             data = json.loads(cleaned_response)
-
         except json.JSONDecodeError as e:
-            print("\n--- INVALID GEMINI RESPONSE ---")
-            print(repr(cleaned_response))
-            print("--- END RESPONSE ---\n")
+            logger.error("Invalid Gemini JSON response during extraction.")
+            logger.error(cleaned_response)
+            raise ValueError("Extraction agent returned invalid JSON.") from e
 
-            raise ValueError(
-                "Extraction agent returned invalid JSON."
-            ) from e
-
-        # --------------------------------------------------
-        # 7. Validate top-level JSON structure
-        # --------------------------------------------------
         if not isinstance(data, list):
-            raise ValueError(
-                "Extraction agent expected a JSON array."
-            )
+            raise ValueError("Expected JSON array from extraction agent.")
 
-        # --------------------------------------------------
-        # 8. Validate evidence items
-        # --------------------------------------------------
-        evidence = []
+        source_lookup = {
+            source.source_id: source for source in sources
+        }
 
-        required_fields = [
-            "claim",
-            "excerpt",
-            "entity",
-            "topic",
-            "relevance_score"
-        ]
+        evidences = []
 
-        for index, item in enumerate(data, start=1):
+        for item in data:
 
             if not isinstance(item, dict):
-                print(
-                    f"Skipping evidence item {index}: "
-                    "not a JSON object."
-                )
                 continue
 
-            # Check required fields
-            missing_fields = [
-                field
-                for field in required_fields
-                if field not in item or item[field] is None
+            required_fields = [
+                "source_id",
+                "claim",
+                "excerpt",
+                "entity",
+                "topic",
+                "relevance_score",
             ]
 
-            if missing_fields:
-                print(
-                    f"Skipping evidence item {index} "
-                    f"because fields are missing: {missing_fields}"
-                )
+            if any(field not in item for field in required_fields):
                 continue
 
-            # Check claim
-            if not str(item["claim"]).strip():
-                print(
-                    f"Skipping evidence item {index}: "
-                    "claim is empty."
-                )
+            source = source_lookup.get(item["source_id"])
+
+            if source is None:
                 continue
 
-            # Check excerpt
-            if not str(item["excerpt"]).strip():
-                print(
-                    f"Skipping evidence item {index}: "
-                    "excerpt is empty."
-                )
-                continue
-
-            # Check relevance score
             try:
-                relevance_score = float(
-                    item["relevance_score"]
-                )
-
-            except (TypeError, ValueError):
-                print(
-                    f"Skipping evidence item {index}: "
-                    "invalid relevance_score."
-                )
+                score = float(item["relevance_score"])
+            except Exception:
                 continue
 
-            if not 0 <= relevance_score <= 1:
-                print(
-                    f"Skipping evidence item {index}: "
-                    f"relevance_score {relevance_score} "
-                    "is outside the 0-1 range."
-                )
-                continue
+            score = max(0.0, min(score, 1.0))
 
-            # --------------------------------------------------
-            # 9. Create Evidence object
-            # --------------------------------------------------
-            evidence.append(
+            evidence_id = (
+                f"{source.source_id}_evidence_{len(evidences)+1:03d}"
+            )
+
+            evidences.append(
                 Evidence(
-                    evidence_id=(
-                        f"{source.source_id}_evidence_"
-                        f"{len(evidence) + 1:03d}"
-                    ),
-                    claim=str(item["claim"]).strip(),
-                    excerpt=str(item["excerpt"]).strip(),
-                    entity=str(item["entity"]).strip(),
-                    topic=str(item["topic"]).strip(),
-                    relevance_score=relevance_score,
-                    source_id=source.source_id
+                    evidence_id=evidence_id,
+                    claim=item["claim"].strip(),
+                    excerpt=item["excerpt"].strip(),
+                    entity=item["entity"].strip(),
+                    topic=item["topic"].strip(),
+                    relevance_score=score,
+                    source_id=source.source_id,
                 )
             )
 
-        # --------------------------------------------------
-        # 10. Make sure at least one valid evidence item exists
-        # --------------------------------------------------
-        if not evidence:
+        if not evidences:
             raise ValueError(
                 "Extraction agent returned no valid evidence."
             )
 
-        return evidence
+        logger.info(
+            f"Extraction completed: {len(evidences)} evidence items "
+            f"from {len(sources)} sources."
+        )
+
+        return evidences
+
+    # -------------------------------------------------------
+    # Response Cleaner
+    # -------------------------------------------------------
+
+    @staticmethod
+    def _clean_response(response: str) -> str:
+        cleaned = response.strip()
+
+        if cleaned.startswith("```"):
+            lines = cleaned.splitlines()
+
+            if lines and lines[0].startswith("```"):
+                lines = lines[1:]
+
+            if lines and lines[-1].startswith("```"):
+                lines = lines[:-1]
+
+            cleaned = "\n".join(lines).strip()
+
+        start = cleaned.find("[")
+        end = cleaned.rfind("]")
+
+        if start != -1 and end != -1:
+            cleaned = cleaned[start:end + 1]
+
+        return cleaned
