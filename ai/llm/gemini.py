@@ -54,12 +54,12 @@ class GeminiLLM(LLM):
         # -------------------------------------------------------
 
         # Primary model (fast + low token usage)
-        self.primary_model = "gemini-3.1-flash-lite"
+        self.primary_model = "gemini-3.7-flash"
 
         # Fallback models (tried in order)
         self.fallback_models = [
             "gemini-3.5-flash",
-            "gemini-3.7-flash",
+            "gemini-3.1-flash-lite",
         ]
 
         logger.info(
